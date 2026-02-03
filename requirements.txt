@@ -1,0 +1,5 @@
+# CPU-only torch
+torch==2.10.0 --find-links https://download.pytorch.org/whl/cpu/torch_stable.html
+
+openai-whisper
+ffmpeg-python

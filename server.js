@@ -2,61 +2,123 @@ require('dotenv').config();
 const fs = require('fs');
 const path = require('path');
 const { exec } = require('child_process');
+const express = require('express');
+const multer = require('multer');
+const https = require('https');
+const ffmpeg = require('fluent-ffmpeg');
+const googleTTS = require('google-tts-api');
 const { GoogleGenerativeAI } = require('@google/generative-ai');
 
-// --- Gemini setup ---
+const app = express();
+const PORT = process.env.PORT || 3000;
+
+const upload = multer({ dest: "uploads/" });
+
 const api_key = process.env.API_GEMINI;
 const genai = new GoogleGenerativeAI(api_key);
-const modelai = genai.getGenerativeModel({ model: "gemini-2.5-flash-lite" });
 
-// --- Paths ---
-const imageFile = path.join(__dirname, "image.jpg");
-const pythonFile = path.join(__dirname, "tran.py"); 
-const audioFile = path.join(__dirname, "audio.wav");
+const modelai = genai.getGenerativeModel({
+  model: "gemini-2.5-flash-lite",
+  systemInstruction:
+    "Your name is BlindEye and you help visually impaired users. Always answer briefly starting with: Hi I'm BlindEye",
+});
 
-// --- Function to run Python Whisper ---
-function transcription() {
-    return new Promise((resolve, reject) => {
-        exec(`python3 "${pythonFile}" "${audioFile}"`, (error, stdout, stderr) => {
-            if (error) return reject(error);
-            if (stderr) console.warn("Python warning:", stderr);
+// ----- Run Whisper Python -----
+function runWhisper(audioPath) {
+  return new Promise((resolve, reject) => {
+    exec(`python3 tran.py "${audioPath}"`,
+      { maxBuffer: 1024 * 1024 * 10 },
+      (error, stdout) => {
+        if (error) return reject(error);
 
-            const match = stdout.match(/Transcription:\s*([\s\S]*)/i);
-            const text = match ? match[1].trim() : stdout.trim();
-            resolve(text);
-        });
+        const match = stdout.match(/Transcription:\s*([\s\S]*)/);
+        resolve(match ? match[1].trim() : stdout.trim());
+      });
+  });
+}
+
+// ----- Send Image + Text to Gemini -----
+async function processImageWithGemini(text, imagePath) {
+  const buffer = fs.readFileSync(imagePath);
+  const base64 = buffer.toString("base64");
+
+  const result = await modelai.generateContent([
+    { text: text },
+    { inlineData: { mimeType: "image/jpeg", data: base64 } },
+  ]);
+
+  return result.response.text();
+}
+
+// ----- Convert Text → REAL WAV -----
+function textToRealWav(text) {
+  return new Promise((resolve, reject) => {
+    const mp3File = "temp.mp3";
+    const wavFile = "response.wav";
+
+    const url = googleTTS.getAudioUrl(text, {
+      lang: "en",
+      slow: false,
+      host: "https://translate.google.com",
     });
+
+    const file = fs.createWriteStream(mp3File);
+
+    https.get(url, (res) => {
+      res.pipe(file);
+
+      file.on("finish", () => {
+        file.close();
+
+        ffmpeg(mp3File)
+          .toFormat("wav")
+          .audioChannels(1)
+          .audioFrequency(16000)
+          .audioBitrate(128)
+          .on("end", () => {
+            fs.unlinkSync(mp3File);
+            resolve(wavFile);
+          })
+          .on("error", reject)
+          .save(wavFile);
+      });
+    });
+  });
 }
 
-// --- Function to process image with Gemini ---
-async function processImage(descriptionText) {
-    try {
-        const buffer = fs.readFileSync(imageFile);
-        const base64 = buffer.toString("base64");
+// ===== MAIN ROUTE ESP32 WILL CALL =====
 
-        console.log("Image loaded, base64 length:", base64.length);
+app.post("/process", upload.fields([
+  { name: "audio" },
+  { name: "image" },
+]), async (req, res) => {
+  try {
+    const audioFile = req.files["audio"][0].path;
+    const imageFile = req.files["image"][0].path;
 
-        const result = await modelai.generateContent([
-            { text: descriptionText }, 
-            { inlineData: { mimeType: "image/jpeg", data: base64 } }
-        ]);
+    console.log("Files received from ESP32");
 
-        console.log("Gemini description:", result.response.text());
-    } catch (err) {
-        console.error("Error processing image:", err);
-    }
-}
+    const transcription = await runWhisper(audioFile);
+    console.log("Transcription:", transcription);
 
-// --- Main flow ---
-async function main() {
-    try {
-        const text = await transcription();
-        console.log("Transcribed text:", text);
+    const geminiText = await processImageWithGemini(transcription, imageFile);
+    console.log("Gemini reply:", geminiText);
 
-        await processImage(text);
-    } catch (err) {
-        console.error("Error:", err);
-    }
-}
+    const wavPath = await textToRealWav(geminiText);
 
-main();
+    res.sendFile(path.join(__dirname, wavPath));
+
+  } catch (err) {
+    console.error(err);
+    res.status(500).send(err.toString());
+  }
+});
+
+// Simple health route
+app.get("/", (req, res) => {
+  res.send("BlindEye AI Server Running");
+});
+
+app.listen(PORT, () => {
+  console.log("Server started on port", PORT);
+});

@@ -19,9 +19,9 @@ const genai = new GoogleGenerativeAI(api_key);
 
 const modelai = genai.getGenerativeModel({
   model: "gemini-2.5-flash-lite",
-  systemInstruction:
-    "Your name is BlindEye and you help visually impaired users. Always answer briefly starting with: Hi I'm BlindEye",
+  systemInstruction: ` Your name is BlindEye. You help visually impaired users by describing images clearly and concisely. Always start with "Hi I'm BlindEye".**Keep your response under 200 characters**, short and polite,using simple language, only describing visible objects in the image. `,
 });
+
 
 // ----- Run Whisper Python -----
 function runWhisper(audioPath) {
@@ -104,7 +104,14 @@ app.post("/process", upload.fields([
     const geminiText = await processImageWithGemini(transcription, imageFile);
     console.log("Gemini reply:", geminiText);
 
-    const wavPath = await textToRealWav(geminiText);
+    let safeText = geminiText;
+
+// Force limit to 200 characters max for Google TTS
+if (safeText.length > 200) {
+  safeText = safeText.substring(0, 197) + "...";
+}
+
+const wavPath = await textToRealWav(safeText);
 
     res.sendFile(path.join(__dirname, wavPath));
 

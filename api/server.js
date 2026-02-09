@@ -1,61 +1,33 @@
-require('dotenv').config();
+const axios = require('axios');
+const FormData = require('form-data');
 const fs = require('fs');
 const path = require('path');
-const express = require('express');
-const multer = require('multer');
 
-const app = express();
-const upload = multer({ dest: "uploads/" });
+app.post("/process", upload.fields([{ name: "audio" }, { name: "image" }]), async (req, res) => {
+  try {
+    const audioFile = req.files["audio"][0].path;
+    const imageFile = req.files["image"][0].path;
 
-const PORT = process.env.PORT || 3000;
+    const form = new FormData();
+    form.append('audio', fs.createReadStream(audioFile));
+    form.append('image', fs.createReadStream(imageFile));
 
-const JOB_FILE = path.join(__dirname, 'jobs/jobs.json');
+    // Send files to local worker
+    const workerRes = await axios.post('http://YOUR_LOCAL_WORKER_IP:3001/process', form, {
+      headers: form.getHeaders(),
+      responseType: 'arraybuffer' // to get WAV as buffer
+    });
 
-function readJobs() {
-  return JSON.parse(fs.readFileSync(JOB_FILE, 'utf-8'));
-}
+    // Send the WAV back to the device
+    res.set('Content-Type', 'audio/wav');
+    res.send(Buffer.from(workerRes.data));
 
-function writeJobs(data) {
-  fs.writeFileSync(JOB_FILE, JSON.stringify(data, null, 2));
-}
+    // Cleanup uploaded files
+    fs.unlinkSync(audioFile);
+    fs.unlinkSync(imageFile);
 
-app.post("/process", upload.fields([{ name: "audio" }, { name: "image" }]), (req, res) => {
-
-  const jobId = Date.now().toString();
-
-  const audioFile = req.files["audio"][0].path;
-  const imageFile = req.files["image"][0].path;
-
-  const jobs = readJobs();
-
-  jobs[jobId] = {
-    audioPath: audioFile,
-    imagePath: imageFile,
-    status: "pending",
-    wavPath: null,
-    error: null
-  };
-
-  writeJobs(jobs);
-
-  res.json({ jobId, message: "Job queued" });
-});
-
-app.get("/result/:jobId", (req, res) => {
-  const jobs = readJobs();
-  const job = jobs[req.params.jobId];
-
-  if (!job) return res.status(404).send("Job not found");
-
-  if (job.status === "done") {
-    res.sendFile(path.join(__dirname, job.wavPath));
-  } else if (job.status === "pending" || job.status === "processing") {
-    res.json({ status: job.status });
-  } else {
-    res.status(500).json({ status: "error", error: job.error });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ status: "error", error: err.toString() });
   }
 });
-
-app.get("/", (req, res) => res.send("BlindEye Server Running"));
-
-app.listen(PORT, () => console.log("Server started on port", PORT));

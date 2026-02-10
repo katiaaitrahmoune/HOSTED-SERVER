@@ -13,7 +13,7 @@ app.post("/process", upload.fields([{ name: "audio" }, { name: "image" }]), asyn
     form.append('image', fs.createReadStream(imageFile));
 
     // Send files to local worker
-    const workerRes = await axios.post('http://YOUR_LOCAL_WORKER_IP:3001/process', form, {
+    const workerRes = await axios.post('https://seminationalized-floretty-shirl.ngrok-free.dev/process', form, {
       headers: form.getHeaders(),
       responseType: 'arraybuffer' // to get WAV as buffer
     });

@@ -4,44 +4,117 @@ const multer = require('multer');
 const axios = require('axios');
 const FormData = require('form-data');
 const fs = require('fs');
-const path = require('path');
+const cors = require('cors');
 
-const app = express(); // ✅ app must be defined
-const upload = multer({ dest: "uploads/" }); // make sure uploads/ folder exists
+const app = express();
+const upload = multer({ dest: 'uploads/' });
+app.use(cors());
 
-// ------------------ ROUTE ------------------
-app.post("/process", upload.fields([{ name: "audio" }, { name: "image" }]), async (req, res) => {
-  try {
-    const audioFile = req.files["audio"][0].path;
-    const imageFile = req.files["image"][0].path;
+// ------------------ SESSION STORE ------------------
+const sessions = {};
+const SESSION_TTL = 60_000; // 1 minute timeout
 
-    const form = new FormData();
-    form.append('audio', fs.createReadStream(audioFile));
-    form.append('image', fs.createReadStream(imageFile));
+function cleanSession(id) {
+  const s = sessions[id];
+  if (!s) return;
+  clearTimeout(s.timer);
+  if (s.audio && fs.existsSync(s.audio)) fs.unlinkSync(s.audio);
+  if (s.image && fs.existsSync(s.image)) fs.unlinkSync(s.image);
+  delete sessions[id];
+}
 
-    // Send files to your local worker (ngrok URL)
-    const workerRes = await axios.post('https://seminationalized-floretty-shirl.ngrok-free.dev/process', form, {
-      headers: form.getHeaders(),
-      responseType: 'arraybuffer' // to get WAV as buffer
-    });
-
-    // Send the WAV back to the device
-    res.set('Content-Type', 'audio/wav');
-    res.send(Buffer.from(workerRes.data));
-
-    // Cleanup uploaded files
-    fs.unlinkSync(audioFile);
-    fs.unlinkSync(imageFile);
-
-  } catch (err) {
-    console.error(err);
-    res.status(500).json({ status: "error", error: err.toString() });
+function getOrCreate(id) {
+  if (!sessions[id]) {
+    sessions[id] = {
+      audio: null,
+      image: null,
+      resolve: null,
+      timer: setTimeout(() => {
+        const s = sessions[id];
+        if (s?.resolve) s.resolve({ timeout: true });
+        cleanSession(id);
+      }, SESSION_TTL),
+    };
   }
+  return sessions[id];
+}
+
+// ------------------ UPLOAD AUDIO ------------------
+app.post('/upload/audio', upload.single('audio'), async (req, res) => {
+  const id = req.query.session_id;
+  if (!id) return res.status(400).json({ error: 'missing session_id' });
+
+  const session = getOrCreate(id);
+  session.audio = req.file.path;
+
+  if (session.image) {
+    // image already here → process immediately
+    const result = await processSession(session, id);
+    if (!result) return res.status(500).json({ error: 'processing failed' });
+    return res.json({ url: result });
+  }
+
+  // wait for image to arrive
+  const result = await new Promise((resolve) => {
+    session.resolve = resolve;
+  });
+
+  if (!result || result.timeout) {
+    return res.status(408).json({ error: 'timeout waiting for image' });
+  }
+
+  return res.json({ url: result });
 });
 
-// ------------------ HEALTHCHECK ------------------
-app.get("/", (req, res) => res.send("BlindEye API Running"));
+// ------------------ UPLOAD IMAGE ------------------
+app.post('/upload/image', upload.single('image'), async (req, res) => {
+  const id = req.query.session_id;
+  if (!id) return res.status(400).json({ error: 'missing session_id' });
 
-// ------------------ START SERVER ------------------
+  const session = getOrCreate(id);
+  session.image = req.file.path;
+
+  if (session.audio) {
+    // audio already waiting → trigger processing
+    res.status(200).json({ status: 'processing' });
+    const result = await processSession(session, id);
+    if (session.resolve) session.resolve(result);
+    return;
+  }
+
+  // audio not here yet
+  res.status(202).json({ status: 'waiting_for_audio' });
+});
+
+// ------------------ WORKER CALL ------------------
+async function processSession(session, id) {
+  const { audio: audioPath, image: imagePath } = session;
+
+  try {
+    const form = new FormData();
+    form.append('audio', fs.createReadStream(audioPath));
+    form.append('image', fs.createReadStream(imagePath));
+
+    const workerRes = await axios.post(`${process.env.WORKER_URL}/process`, form, {
+      headers: {
+        ...form.getHeaders(),
+        'ngrok-skip-browser-warning': 'true'
+      },
+      responseType: 'json'
+    });
+
+    return workerRes.data.url; // Cloudinary URL
+
+  } catch (err) {
+    console.error('Worker error:', err.message);
+    return null;
+  } finally {
+    cleanSession(id);
+  }
+}
+
+// ------------------ HEALTHCHECK ------------------
+app.get('/', (req, res) => res.send('BlindEye API Running'));
+
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => console.log(`Server running on port ${PORT}`));
